@@ -1,0 +1,257 @@
+#!/bin/bash
+
+# Copyright (C) 2010/11 Thomas Luebking <thomas.luebking@web.de>
+# 
+# This script is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public
+# License version 2 as published by the Free Software Foundation.
+# 
+# This script is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# Library General Public License for more details.
+# 
+# You should have received a copy of the GNU Library General Public License
+# along with this library; see the file COPYING.LIB.  If not, write to
+# the Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
+# Boston, MA 02110-1301, USA.
+
+# restrictions format ------------------------------
+
+# - :Genre
+# -- 50:Classical
+# --- 60:Artist
+# ---- 50:Beethoven
+# ---- 25:Schubert
+# ---- 25:Mahler
+# --- 40:Album
+# ---- 60:Symphony
+# ---- 30:Sonata
+# ---- 10:Mass
+# -- 50:Soundtrack
+# --- :Artist
+# ---- 33:Zimmer
+# ---- 33:Williams
+# ----- 20:Album
+# ------ :Star Wars
+# ---- 34:Morricone
+
+# Keys ----------------------------------------------
+
+# any|Artist|Album|AlbumArtist|Title|Track|Name|Genre|Date|Composer|Performer|Comment|Disc
+
+# ---------------------------------------------------
+
+find_search()
+{
+    last_level=1
+    max_level=1000
+    cluster=0
+    rnd=$((RANDOM%100))
+    unset search
+    exec 9<$*
+    while read -u9 line
+    do
+        level=${line%% *};
+        level=${#level}
+        if (( level > max_level )); then
+        # we're still looking for a match on this level and can't step down
+            continue
+        fi
+
+        if (( level < last_level )); then
+        # we've dealt this level. as the follow up ain't bigger, there's no successor
+            l=${#search[*]}
+            if (( l % 2 )); then # invalid - mpc wants pairs
+                ((--l))
+                unset search[l]
+            fi
+            return 0
+        fi
+        last_level=$level
+        
+        # segment probability & string
+        entry=${line#* }
+        percent=${entry%%:*}; percent=${percent:-100}
+        entry=${entry#*:}
+        cluster=$((cluster + percent))
+        if (( rnd < cluster )); then # this is a match
+            cluster=0
+            max_level=1000
+            search=("${search[@]}" "$entry")
+            rnd=$((RANDOM%100))
+            last_level=$((level + 1))
+        else # we need to find the next element on this level
+            max_level=$level
+        fi
+    done
+    l=${#search[*]}
+    if (( l % 2 )); then # invalid - mpc wants pairs
+        ((--l))
+        unset search[l]
+    fi
+}
+
+# CONFIG ---------------------------------
+
+ENTRIES=10
+CURRENT=5
+LOCK_FILE=/tmp/mpdynamizer.lock
+RESUME_FILE=$HOME/.mpdynamizer.resume
+RESTRICTIONS_FILE=$HOME/.mpdynamizer.restrictions
+RESTRICTIONS_POOL=$HOME/.mpdynamizer.pool
+TIMEOUT=20
+
+source $HOME/.mpdynamizer.conf 2>/dev/null
+
+EDITOR=${EDITOR:-"vim"}
+
+# ----------------------
+
+# DAEMONIZE ---------------------------------
+
+cmd="$1"
+
+if [ -e "$LOCK_FILE" ]; then
+    if [ "$cmd" = "toggle" ]; then
+        cmd="stop"
+    fi
+elif [ "$cmd" = "toggle" -o "$cmd" = "resume" ]; then
+    cmd="start"
+fi
+
+case "$cmd" in
+  start)
+    if [ ! -e "$RESTRICTIONS_FILE" ]; then
+        echo "There is no restrictions definition ($RESTRICTIONS_FILE)"
+        echo "Not doing anything until you add one!"
+        echo "Call \"$0 edit <some_restrictions>\" and then"
+        echo "\"$0 load <some_restrictions>\""
+    fi
+    if [ ! -e "$LOCK_FILE" ]; then
+#         $0 "daemon"  &
+        nohup $0 "daemon" >/dev/null 2>&1  &
+        echo $! > "$LOCK_FILE"
+    fi    
+    exit
+    ;;
+  stop)
+    rm -f "$RESUME_FILE"
+    if [ -e "$LOCK_FILE" ]; then
+        pid=$(cat "$LOCK_FILE")
+        kill $pid
+        pkill -P $pid
+    fi
+    exit
+    ;;
+  load)
+    if [ -z $2 ] || [ ! -e "$RESTRICTIONS_POOL/$2" ]; then
+        echo "You must specify an existing restriction as last parameter"
+        echo "Try $0 listRestrictions"
+        exit
+    fi
+    ln -sf "$RESTRICTIONS_POOL/$2" "$RESTRICTIONS_FILE"
+    exit
+    ;;
+  edit)
+    if [ -z $2 ]; then
+        if [ -e "$RESTRICTIONS_FILE" ]; then
+            $EDITOR "$RESTRICTIONS_FILE"
+        else
+            echo "There's no current restriction. Either load one or pass a name for the"
+            echo "restriction to create/edit"
+            exit
+        fi
+    else
+        mkdir "$RESTRICTIONS_POOL" > /dev/null 2>&1
+        $EDITOR "$RESTRICTIONS_POOL/$2"
+    fi
+    exit
+    ;;
+  listRestrictions)
+    mkdir "$RESTRICTIONS_POOL" > /dev/null 2>&1
+    ls "$RESTRICTIONS_POOL"
+    exit
+    ;;
+  daemon)
+    touch "$RESUME_FILE"
+    ;;
+  *)
+    echo -e "\nUsage:\n------\n   $0 start|stop|toggle|edit [restriction]|load <restriction>|listRestrictions\n"
+    exit
+esac
+
+# ----------------------
+
+trap 'rm "$LOCK_FILE"; exit' INT TERM EXIT
+# trap  'rm "$LOCK_FILE"; exit' SIGHUP SIGINT SIGTERM
+
+# MAIN LOOP ---------------------------------
+
+# mpc crop #clear playlist except for playing tune
+
+while true; do
+    if ! mpc status; then
+        sleep $TIMEOUT
+        continue
+    fi
+    # get status
+#     status="$(mpc status | head -2 | tail -1)"
+    status="$(mpc status | grep -E "(pause|playing)")"
+    status=${status#*\#}
+    status=${status%% *}
+    
+    if [ -z $status ]; then # we're not playing or mpd isn't up
+        mpc idle player
+        continue
+    fi
+    
+    # current playlist entry id
+    pl_current=${status%%/*}; pl_current=${pl_current##\#}
+    # amount of tunes in the playlist
+    pl_length=${status##*/};
+    # trim playlist start so that current becomes <=5
+    for (( i=0; i < pl_current - CURRENT; ++i )); do
+        ((--pl_length))
+        mpc del 1
+    done
+    
+    # fill up playlist to 10 random tunes
+    while (( pl_length < ENTRIES )); do
+        find_search "$RESTRICTIONS_FILE"
+#         echo "search" "${search[@]}"
+        count=0 # ${#reply[@]} returns shit
+        
+        if (( ! ${#search[*]} )); then
+            # empty query -> "list all"
+            n=$(mpc stats | grep -i songs)
+            n=${n##* }
+            n=$(( RANDOM % n ))
+            
+            while read line; do
+                if (( count == n )); then
+                    mpc add "$line"
+                    break
+                fi
+                ((++count))
+            done < <(mpc listall)
+        else
+            # redirect search reply into 'reply'
+            while read line; do
+                reply[$count]="$line"
+                ((++count))
+            done < <(mpc search "${search[@]}")
+            
+            if ((count == 0)); then # didn't find anything, try again
+                continue #sleep 5 # WAIT? to not stress cpu??
+            fi
+            mpc add "${reply[$((RANDOM % count))]}"
+        fi
+        ((++pl_length))
+    done
+    # wait untile sth. happens
+    mpc idle player
+done
+
+rm $LOCK_FILE
+trap - INT TERM EXIT

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=BE::MPC
+Comment=Control your MusicPlayerDaemon
+GenericName=MPD Client
+Exec=be.mpc
+Terminal=false
+Type=Application
+Icon=be.mpc
+Categories=Application;Qt;Audio;
+StartupNotify=false
